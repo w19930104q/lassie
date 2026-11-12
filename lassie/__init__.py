@@ -18,4 +18,4 @@ __version__ = '0.11.11'
 
 from .api import fetch
 from .core import Lassie
-from .exceptions import LassieError
+from .exceptions import LassieError, LassieMaxBytesExceeded

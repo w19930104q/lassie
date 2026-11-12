@@ -55,6 +55,29 @@ Usage
         'locale': u'en_US'
     }
 
+Limiting Response Size
+~~~~~~~~~~~~~~~~~~~~~~
+
+Pass ``max_bytes`` to cap the decompressed body bytes a single fetch may
+read across its oEmbed, HTML and intermediate redirect responses. The
+default (``None``) is unlimited; reading exactly the limit succeeds and the
+first chunk past it raises ``LassieMaxBytesExceeded`` (a ``LassieError``
+subclass) without returning truncated data:
+
+.. code-block:: python
+
+    >>> import lassie
+    >>> from lassie import Lassie, LassieMaxBytesExceeded
+    >>> lassie.fetch('http://example.com', max_bytes=5 * 1024 * 1024)
+
+    >>> l = Lassie()
+    >>> l.max_bytes = 1024 * 1024  # instance-level default
+    >>> l.fetch('http://example.com')
+
+Bodies are streamed and counted as they are read, so an unreliable
+``Content-Length`` is ignored, gzip is counted after decompression and
+chunked responses are reassembled before counting.
+
 Install
 -------
 

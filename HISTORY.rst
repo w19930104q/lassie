@@ -3,6 +3,15 @@
 History
 -------
 
+Unreleased
+++++++++++
+- Add an optional ``max_bytes`` budget to ``fetch`` and ``Lassie`` to cap
+  the cumulative decompressed body bytes read across oEmbed, HTML and
+  intermediate redirect responses. Exceeding the budget raises the new
+  ``LassieMaxBytesExceeded`` exception; streaming, chunked transfer
+  encoding, gzip and untrustworthy ``Content-Length`` headers are all
+  handled on actual bytes read.
+
 0.11.11 (2020-12-16)
 ++++++++++++++++++
 - No changes.

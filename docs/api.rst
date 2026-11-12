@@ -18,3 +18,6 @@ Exceptions
 ----------
 
 .. autoexception:: lassie.LassieError
+
+.. autoexception:: lassie.LassieMaxBytesExceeded
+   :members:

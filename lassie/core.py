@@ -18,12 +18,14 @@ from bs4 import BeautifulSoup
 from requests import Request, Session
 
 from .compat import str, urljoin, urlparse
-from .exceptions import LassieError
+from .exceptions import LassieError, LassieMaxBytesExceeded
 from .filters import FILTER_MAPS
-from .filters.oembed.providers import consumer, parse_oembed_data
+from .filters.oembed.providers import (
+    build_oembed_url, get_oembed_endpoint, parse_oembed_data, parse_oembed_response,
+)
 from .utils import (
-    FAKE_USER_AGENT, clean_text, convert_to_int, determine_user_agent, normalize_image_data,
-    normalize_locale,
+    FAKE_USER_AGENT, READ_CHUNK_SIZE, ByteBudget, clean_text, convert_to_int,
+    determine_user_agent, normalize_image_data, normalize_locale,
 )
 
 REQUEST_OPTS = {
@@ -48,7 +50,7 @@ class Lassie(object):
     __attrs__ = [
         'open_graph', 'twitter_card', 'touch_icon', 'favicon',
         'canonical', 'all_images', 'parser', '_retrieve_content',
-        'client'
+        'client', 'max_bytes'
     ]
 
     def __init__(self):
@@ -63,6 +65,9 @@ class Lassie(object):
         self.handle_file_content = False
         self.user_agent_set_manually = False
         self._request_opts = {}
+        #: Optional per-fetch cap on decompressed body bytes. ``None`` means
+        #: no limit; a per-call ``max_bytes`` argument takes precedence.
+        self.max_bytes = None
         self.client = Session()
 
     @property
@@ -96,7 +101,7 @@ class Lassie(object):
 
     def fetch(self, url, open_graph=None, twitter_card=None, touch_icon=None,
               favicon=None, all_images=None, parser=None, handle_file_content=None,
-              canonical=None):
+              canonical=None, max_bytes=None):
         """Retrieves content from the specified url, parses it, and returns
         a beautifully crafted dictionary of important information about that
         web page.
@@ -124,6 +129,8 @@ class Lassie(object):
         :type parser: string
         :param handle_file_content: (optional) If ``True``, lassie will return a generic response when a file is fetched. Default: False
         :type handle_file_content: bool
+        :param max_bytes: (optional) Maximum number of decompressed body bytes this fetch may read in total across the HTML response, the oEmbed response and any intermediate redirect responses. Bodies are streamed, so the read stops as soon as the limit would be exceeded and a :class:`~lassie.exceptions.LassieMaxBytesExceeded` is raised; exactly ``max_bytes`` bytes is still successful. Defaults to the instance's ``max_bytes`` attribute, which itself defaults to ``None`` (unlimited).
+        :type max_bytes: int or None
 
         """
 
@@ -136,6 +143,17 @@ class Lassie(object):
         all_images = merge_settings(all_images, self.all_images)
         parser = merge_settings(parser, self.parser)
         handle_file_content = merge_settings(handle_file_content, self.handle_file_content)
+        max_bytes = merge_settings(max_bytes, self.max_bytes)
+
+        if max_bytes is not None:
+            if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+                raise TypeError('max_bytes must be a positive integer or None')
+            if max_bytes < 0:
+                raise ValueError('max_bytes must be a positive integer or None')
+
+        # One budget for every response read during this fetch, so the limit
+        # accumulates across oEmbed, HTML and intermediate redirect responses.
+        byte_budget = ByteBudget(max_bytes)
 
         data = {
             'images': [],
@@ -160,13 +178,18 @@ class Lassie(object):
                     'src': url,
                 })
         else:
+            # LassieMaxBytesExceeded is a LassieError on purpose for callers
+            # that catch the base class, but it must not be swallowed by the
+            # oEmbed fallback below, so it is handled explicitly.
             try:
-                oembed_data, status_code = self._retrieve_oembed_data(url)
+                oembed_data, status_code = self._retrieve_oembed_data(url, byte_budget)
                 parse_oembed_data(oembed_data, data)
+            except LassieMaxBytesExceeded:
+                raise
             except LassieError:
                 oembed_data = None
 
-            html, status_code = self._retrieve_content(url)
+            html, status_code = self._retrieve_content(url, byte_budget)
 
             if not html and not oembed_data:
                 raise LassieError('There was no content to parse.')
@@ -233,17 +256,27 @@ class Lassie(object):
 
         return prepped
 
-    def _retrieve_oembed_data(self, url):  # pragma: no cover
+    def _retrieve_oembed_data(self, url, byte_budget=None):
+        endpoint = get_oembed_endpoint(url)
+        if endpoint is None:
+            # Mirrors OEmbedConsumer.embed raising OEmbedNoEndpoint here.
+            raise LassieError('There are no oEmbed endpoints available for %s' % url)
+
+        oembed_url = build_oembed_url(endpoint, url)
+        content, response, status_code = self._stream_get(
+            oembed_url, byte_budget, headers=endpoint._requestHeaders
+        )
+
         try:
-            response = consumer.embed(url)
-            oembed_data = response.getData()
-            status_code = 200
+            oembed_data = parse_oembed_response(
+                content, response.headers.get('Content-Type')
+            )
         except Exception as e:
             raise LassieError(e)
 
         return oembed_data, status_code
 
-    def _retrieve_headers(self, url):  # pragma: no cover
+    def _retrieve_headers(self, url):
         request_kwargs = self.merge_request_kwargs()
 
         try:
@@ -256,18 +289,137 @@ class Lassie(object):
 
         return response.headers, response.status_code
 
-    def _retrieve_content(self, url):  # pragma: no cover
-        request_kwargs = self.merge_request_kwargs()
+    def _retrieve_content(self, url, byte_budget=None):
+        _body, response, status_code = self._stream_get(url, byte_budget)
+        # The streamed bytes were cached on the response, so .text applies
+        # requests' normal charset detection (headers then HTML meta tags),
+        # keeping decoding behavior identical to the previous implementation.
+        return response.text, status_code
 
-        try:
-            request = self._prepare_request(
-                'GET', url, headers=self.client.headers, **request_kwargs
+    def _stream_get(self, url, byte_budget=None, headers=None):
+        """GET ``url`` while streaming every body through ``byte_budget``.
+
+        Redirects are followed manually (each request is sent with
+        ``allow_redirects=False``) so that every intermediate response body
+        can be read in bounded chunks and accounted for instead of being
+        consumed whole by requests. An explicit
+        ``request_opts={'allow_redirects': False}`` is still honored: in that
+        case the first redirect response is returned as-is. Bodies are read
+        as decompressed bytes (gzip and chunked transfer encoding are handled
+        by urllib3), which means missing or untrustworthy
+        ``Content-Length`` headers never affect the accounting: only bytes
+        actually pulled from the socket count.
+
+        On success the final response's bytes are returned alongside the
+        (closed) response and its status code. The response keeps its cached
+        body, so ``.text`` and ``.headers`` remain usable after the connection
+        has been released. On a budget failure the partially-read response
+        (and any connection it holds) is closed before
+        :class:`LassieMaxBytesExceeded` propagates, so the shared client stays
+        usable for subsequent fetches.
+
+        :returns: ``(body_bytes, response, status_code)``
+
+        """
+        if byte_budget is None:
+            byte_budget = ByteBudget()
+
+        request_kwargs = self.merge_request_kwargs()
+        # Stream is required to enforce the budget during the read; callers
+        # cannot turn it off. Redirect following is driven manually below so
+        # redirect bodies count, while an explicit False is still respected.
+        follow_redirects = request_kwargs.pop('allow_redirects', True)
+        request_kwargs['stream'] = True
+        request_kwargs['allow_redirects'] = False
+
+        request_headers = self.client.headers
+        if headers:
+            request_headers = requests.structures.CaseInsensitiveDict(
+                dict(self.client.headers, **headers)
             )
-            response = self.client.send(request, **request_kwargs)
+
+        response = None
+        redirects_followed = 0
+        try:
+            while True:
+                request = self._prepare_request(
+                    'GET', url, headers=request_headers, **request_kwargs
+                )
+                response = self.client.send(request, **request_kwargs)
+
+                body = self._read_body_with_budget(response, byte_budget)
+                self._finalize_response(response, body)
+
+                redirect_location = self.client.get_redirect_target(response)
+                if redirect_location is None or not follow_redirects:
+                    return body, response, response.status_code
+
+                # This response's body has been fully read and closed; the
+                # redirect target becomes the next request's url. Relative
+                # locations and scheme-relative urls are resolved the same
+                # way requests itself resolves them.
+                url = urljoin(response.url, redirect_location)
+                response = None
+
+                # Mirror requests: before following, the current history
+                # length is redirects_followed; refuse once that reaches the
+                # configured maximum.
+                if redirects_followed >= self.client.max_redirects:
+                    raise requests.exceptions.TooManyRedirects(
+                        'Exceeded %s redirects.' % self.client.max_redirects
+                    )
+                redirects_followed += 1
+        except LassieMaxBytesExceeded as e:
+            if e.url is None and response is not None:
+                e.url = response.url
+            raise
+        except requests.exceptions.RequestException as e:
+            raise LassieError(e)
+        finally:
+            # Budget failures and unexpected errors must never leave a
+            # response (and its pooled connection) open.
+            if response is not None:
+                response.close()
+
+    def _read_body_with_budget(self, response, byte_budget):
+        """Stream ``response`` in chunks, accounting each chunk's size.
+
+        Reading stops at the first chunk that would exceed the budget; the
+        remainder of that chunk is discarded by closing the response.
+
+        :raises LassieMaxBytesExceeded: when the cumulative read would exceed
+            ``byte_budget.max_bytes``.
+
+        """
+        body = b''
+        try:
+            for chunk in response.iter_content(
+                chunk_size=READ_CHUNK_SIZE, decode_unicode=False
+            ):
+                if not chunk:
+                    continue
+                # Raises as soon as this chunk would cross the limit; the
+                # chunk itself is never appended, so no truncated body is
+                # returned.
+                byte_budget.account(chunk)
+                body += chunk
         except requests.exceptions.RequestException as e:
             raise LassieError(e)
 
-        return response.text, response.status_code
+        return body
+
+    def _finalize_response(self, response, body):
+        """Populate the response's cached content and release its connection.
+
+        Setting ``_content`` keeps ``response.text``/``response.encoding``
+        semantics identical to a non-streamed request while ensuring the
+        connection is returned to the pool even though the body was consumed
+        through ``iter_content``.
+
+        """
+        response._content = body
+        response._content_consumed = True
+        response.close()
 
     def merge_request_kwargs(self):
         request_kwargs = {}

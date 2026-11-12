@@ -9,7 +9,7 @@ from lassie.core import Lassie
 from lassie.exceptions import LassieError
 
 
-def _mock_retrieve_oembed_data(mock, url):
+def _mock_retrieve_oembed_data(mock, url, byte_budget=None):
     if '.json' not in url:
         return {}, 404
 
@@ -26,7 +26,7 @@ def _mock_retrieve_oembed_data(mock, url):
     return json.loads(content), status_code
 
 
-def _mock_retrieve_content(mock, url):
+def _mock_retrieve_content(mock, url, byte_budget=None):
     if '.html' not in url:
         filename = '/generic/all_properties.html'
     else:

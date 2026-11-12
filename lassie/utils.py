@@ -14,10 +14,52 @@ import re
 from requests.utils import default_user_agent
 
 from .compat import str, urljoin
+from .exceptions import LassieMaxBytesExceeded
 
 CLEANER = re.compile(r'[\r\n\t]')
 RE_INT = re.compile(r'\d+')
 FAKE_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_4) AppleWebKit/603.1.20 (KHTML, like Gecko) Version/10.1 Safari/603.1.20'
+
+#: Number of bytes pulled from the socket per iteration while streaming a
+#: response body. Small enough that an over-limit body is stopped shortly
+#: after crossing the ``max_bytes`` budget instead of being buffered whole.
+READ_CHUNK_SIZE = 1024
+
+
+class ByteBudget(object):
+    """Tracks the decompressed body bytes read across a single ``fetch``.
+
+    The same budget is shared by the HTML response, the oEmbed response and
+    every intermediate redirect response, so the limit applies to the
+    cumulative bytes of the whole fetch rather than to each request on its
+    own. ``None`` means no limit is enforced.
+
+    """
+
+    def __init__(self, max_bytes=None):
+        self.max_bytes = max_bytes
+        self.read_bytes = 0
+
+    @property
+    def limited(self):
+        return self.max_bytes is not None
+
+    def account(self, chunk):
+        """Account for ``chunk``'s bytes against the remaining budget.
+
+        :param chunk: A chunk of decompressed body bytes.
+        :raises lassie.exceptions.LassieMaxBytesExceeded: if adding the
+            chunk would push the running total above ``max_bytes``.
+        :returns: The number of bytes added.
+
+        """
+        chunk_len = len(chunk)
+        if self.limited and self.read_bytes + chunk_len > self.max_bytes:
+            raise LassieMaxBytesExceeded(self.max_bytes, self.read_bytes)
+
+        self.read_bytes += chunk_len
+        return chunk_len
+
 
 def clean_text(value):
     """Removes all line breaks, new lines and tabs from the specified content

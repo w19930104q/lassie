@@ -37,6 +37,8 @@ def fetch(url, **kwargs):
     :type parser: string
     :param handle_file_content: (optional) If ``True``, lassie will return a generic response when a file is fetched. Default: False
     :type handle_file_content: bool
+    :param max_bytes: (optional) Maximum number of decompressed body bytes this fetch may read in total (HTML, oEmbed and intermediate redirect responses combined). Bodies are streamed; reading exactly ``max_bytes`` bytes succeeds and the first chunk past the limit raises :class:`~lassie.exceptions.LassieMaxBytesExceeded`. Default: ``None`` (unlimited).
+    :type max_bytes: int or None
 
     """
     l = Lassie()
